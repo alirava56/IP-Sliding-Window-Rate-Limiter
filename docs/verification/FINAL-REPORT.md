@@ -16,12 +16,12 @@ The Windows run began with a fresh local Git clone, without `node_modules` or `d
 | `npm test`                     | PASS         | 50 passed, zero failed or skipped on Windows.                                                                                                                                                |
 | `npm run test:core`            | PASS         | 18 passed from the Windows clone before any manual build.                                                                                                                                    |
 | `npm run test:coverage`        | PASS         | 50 passed on all three environments. Coverage was 99.03% lines, 96.25% branches and 95.56% functions.                                                                                        |
-| `npm run smoke`                | PASS         | Built and opened a private loopback listener. Observed 10 admissions, two 429s and a working health route in each environment.                                                               |
+| `npm run smoke`                | PASS         | Built and opened a private loopback listener. Observed 10 admissions, two 429s and a working health route in each environment. A second Windows clone ran it before any other build.         |
 | `npm audit --omit=dev`         | PASS         | Registry returned zero advisories for the production dependency set.                                                                                                                         |
 | `npm audit`                    | PASS         | Registry returned zero advisories including development dependencies.                                                                                                                        |
 | `npm run dev` and `npm start`  | PASS         | Both loaded a PowerShell process environment override and handled health 200, JSON echo 200 and subsequent demo 429 at quota 1.                                                              |
 | `docker build --no-cache`      | PASS         | Built the Linux amd64 runtime from the digest-pinned Node.js 24.22.3 Alpine image.                                                                                                           |
-| Container startup and shutdown | PASS         | Health and demo returned 200. Node ran as PID 1 and UID 1000. `/app` contained compiled code and production dependencies.                                                                    |
+| Container startup and shutdown | PASS         | Health and demo returned 200. Node ran as PID 1 and UID 1000. `/app` contained compiled code, production dependencies and a byte-identical copy of the MIT license.                          |
 | `actionlint` 1.7.11            | PASS         | The workflow passed static validation. All required npm steps ran locally against both Node versions in the matrix.                                                                          |
 | Git history and source review  | PASS         | Gitleaks 8.30.1 reported no detected secrets. Confirmed the lockfile is tracked, dependency artifacts and local env files are ignored, and the original MIT license matches its source hash. |
 | Hosted GitHub Actions          | NOT VERIFIED | The project is still local. The first push or pull request will trigger the hosted workflow.                                                                                                 |
@@ -46,7 +46,7 @@ The core tests compare 15,000 generated operations against a reference log over 
 
 - `docker stop --time 12` delivered SIGTERM and the idle service exited 0.
 - SIGINT followed by SIGTERM while an admitted upload was active allowed the upload to finish with HTTP 200. The container exited 0.
-- A stalled request was disconnected after SIGTERM. The container exited 1 in 10.40 seconds, including the Docker signal and wait calls.
+- A stalled request was disconnected after SIGTERM. The container exited 1 in 10.38 seconds, including the Docker signal and wait calls.
 
 ## Performance
 

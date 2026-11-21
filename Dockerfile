@@ -14,6 +14,7 @@ RUN npm ci --omit=dev --no-audit --no-fund
 
 FROM base AS runtime
 ENV NODE_ENV=production
+COPY LICENSE ./LICENSE
 COPY --from=production-dependencies /app/node_modules ./node_modules
 COPY --from=build /app/dist ./dist
 USER node
