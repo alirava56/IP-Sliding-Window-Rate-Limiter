@@ -2,6 +2,10 @@ import type { RequestHandler } from 'express';
 import { normalizeIp } from '../ip';
 import type { SlidingWindowLimiter } from '../limiter/sliding-window';
 
+function delaySeconds(ms: number): string {
+  return String(Math.max(1, Math.ceil(ms / 1000)));
+}
+
 export function rateLimitMiddleware(limiter: SlidingWindowLimiter): RequestHandler {
   return (req, res, next) => {
     const clientIp = normalizeIp(req.ip ?? req.socket.remoteAddress ?? '');
@@ -14,14 +18,14 @@ export function rateLimitMiddleware(limiter: SlidingWindowLimiter): RequestHandl
 
     const decision = limiter.check(clientIp);
     if (decision.kind === 'capacity_exceeded') {
-      res.setHeader('Retry-After', String(Math.ceil(decision.retryAfterMs / 1000)));
+      res.setHeader('Retry-After', delaySeconds(decision.retryAfterMs));
       res
         .status(503)
         .json({ error: 'RATE_LIMITER_CAPACITY', message: 'Limiter is temporarily at capacity' });
       return;
     }
 
-    const reset = String(Math.ceil(decision.resetAfterMs / 1000));
+    const reset = delaySeconds(decision.resetAfterMs);
     res.setHeader('RateLimit-Limit', String(decision.limit));
     res.setHeader('RateLimit-Remaining', String(decision.remaining));
     res.setHeader('RateLimit-Reset', reset);

@@ -85,6 +85,54 @@ test('sweep frees expired buckets', () => {
   assert.equal(limiter.trackedClients, 0);
 });
 
+test('a fractional timestamp above the cutoff is retained by quota, capacity and sweep', () => {
+  const { limiter, tick } = setup({ maxRequests: 1, maxTrackedClients: 1 });
+  tick(Number.EPSILON);
+  assert.equal(limiter.check('a').resetAfterMs, 1000);
+  tick(1000);
+  assert.equal(limiter.sweep(), 0);
+  assert.deepEqual(limiter.check('a'), {
+    kind: 'rate_limited',
+    limit: 1,
+    remaining: 0,
+    resetAfterMs: Number.EPSILON,
+  });
+  assert.deepEqual(limiter.check('b'), {
+    kind: 'capacity_exceeded',
+    retryAfterMs: Number.EPSILON,
+  });
+  tick(1000 + 2 ** -43);
+  assert.equal(limiter.check('b').kind, 'allowed');
+});
+
+test('capacity retry is based on the last acceptance in the first releasable bucket', () => {
+  const { limiter, tick } = setup({ maxRequests: 2, maxTrackedClients: 2 });
+  limiter.check('a');
+  tick(200);
+  limiter.check('b');
+  tick(500);
+  limiter.check('a');
+  assert.deepEqual(limiter.check('c'), { kind: 'capacity_exceeded', retryAfterMs: 700 });
+  tick(1199);
+  assert.deepEqual(limiter.check('c'), { kind: 'capacity_exceeded', retryAfterMs: 1 });
+  tick(1200);
+  assert.equal(limiter.check('c').kind, 'allowed');
+});
+
+test('sweep batches reclaim only the expired prefix and respect the deletion budget', () => {
+  const { limiter, tick } = setup();
+  for (const key of ['a', 'b', 'c']) limiter.check(key);
+  tick(100);
+  limiter.check('active');
+  tick(1000);
+  assert.throws(() => limiter.sweep(0), /Sweep batch size/);
+  assert.equal(limiter.sweep(2), 2);
+  assert.equal(limiter.trackedClients, 2);
+  assert.equal(limiter.sweep(2), 1);
+  assert.equal(limiter.sweep(2), 0);
+  assert.equal(limiter.check('active').remaining, 0);
+});
+
 test('options and empty keys are validated', () => {
   assert.throws(
     () => new SlidingWindowLimiter({ maxRequests: 0, windowMs: 1000, maxTrackedClients: 5 }),
@@ -226,15 +274,16 @@ for (const options of modelCases) {
       tick(sample);
       time = Math.max(time, sample);
       const key = `ip-${random() % keys}`;
-      const active = (stamps) => stamps.filter((timestamp) => time - timestamp < windowMs);
+      const active = (stamps) => stamps.filter((timestamp) => timestamp > time - windowMs);
       const stamps = active(reference.get(key) ?? []);
-      const activeKeys = [...reference.values()].filter(
-        (entries) => active(entries).length > 0,
-      ).length;
+      const liveBuckets = [...reference.values()]
+        .map(active)
+        .filter((entries) => entries.length > 0);
 
       let expected;
-      if (stamps.length === 0 && activeKeys === maxTrackedClients) {
-        expected = { kind: 'capacity_exceeded', retryAfterMs: 1000 };
+      if (stamps.length === 0 && liveBuckets.length === maxTrackedClients) {
+        const release = Math.min(...liveBuckets.map((entries) => entries.at(-1) + windowMs));
+        expected = { kind: 'capacity_exceeded', retryAfterMs: release - time };
       } else {
         const allowed = stamps.length < maxRequests;
         if (allowed) stamps.push(time);

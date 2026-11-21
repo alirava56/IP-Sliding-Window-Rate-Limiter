@@ -22,8 +22,10 @@
     "bench": "npm run build && node --expose-gc scripts/benchmark.mjs"
   },
   "dependencies": {
+    "content-type": "^2.1.0",
     "express": "^5.3.0",
-    "ipaddr.js": "^2.5.0"
+    "ipaddr.js": "^2.5.0",
+    "raw-body": "^3.0.2"
   },
   "devDependencies": {
     "@eslint/js": "^10.0.1",

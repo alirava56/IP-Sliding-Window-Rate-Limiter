@@ -1,10 +1,28 @@
-import express, { type ErrorRequestHandler } from 'express';
+import { isUtf8 } from 'node:buffer';
+import { parse as parseContentType } from 'content-type';
+import express, { type ErrorRequestHandler, type Response } from 'express';
+import readBody from 'raw-body';
 import type { AppConfig } from './config';
 import { compileProxyTrust } from './ip';
 import { SlidingWindowLimiter } from './limiter/sliding-window';
 import { rateLimitMiddleware } from './middleware/rate-limit';
 
 const JSON_LIMIT_BYTES = 16 * 1024;
+const utf8 = new TextDecoder();
+
+function isJsonContainer(text: string): boolean {
+  try {
+    const value: unknown = JSON.parse(text);
+    return value !== null && typeof value === 'object';
+  } catch (error) {
+    if (!(error instanceof SyntaxError)) throw error;
+    return false;
+  }
+}
+
+function payloadTooLarge(res: Response): void {
+  res.status(413).json({ error: 'PAYLOAD_TOO_LARGE', message: 'JSON payload exceeds 16 KiB' });
+}
 
 export function createApp(config: AppConfig, now?: () => number) {
   const app = express();
@@ -32,14 +50,62 @@ export function createApp(config: AppConfig, now?: () => number) {
   });
 
   app.use('/api', rateLimitMiddleware(limiter));
-  app.use('/api', express.json({ limit: JSON_LIMIT_BYTES, strict: true, inflate: false }));
 
   app.get('/api/demo', (_req, res) => {
     res.json({ message: 'Request accepted', ip: res.locals.clientIp });
   });
 
-  app.post('/api/echo', (req, res) => {
-    res.json({ message: 'Payload accepted', data: req.body ?? null });
+  app.post('/api/echo', async (req, res) => {
+    const length = Number(req.headers['content-length'] ?? 0);
+    if (length === 0 && req.headers['transfer-encoding'] === undefined) {
+      res.json({ message: 'Payload accepted', data: null });
+      return;
+    }
+    if (length > JSON_LIMIT_BYTES) {
+      res.set('Connection', 'close');
+      payloadTooLarge(res);
+      return;
+    }
+
+    const contentType = parseContentType(req.headers['content-type'] ?? '');
+    if (contentType.type !== 'application/json') {
+      res.set('Connection', 'close').status(415).json({
+        error: 'UNSUPPORTED_MEDIA_TYPE',
+        message: 'Content-Type must be application/json',
+      });
+      return;
+    }
+
+    const charset = contentType.parameters.charset?.toLowerCase() ?? 'utf-8';
+    const encoding = req.headers['content-encoding']?.toLowerCase() ?? 'identity';
+    if ((charset !== 'utf-8' && charset !== 'utf8') || encoding !== 'identity') {
+      if (encoding !== 'identity') res.set('Accept-Encoding', 'identity');
+      res.set('Connection', 'close').status(415).json({
+        error: 'UNSUPPORTED_BODY_ENCODING',
+        message: 'JSON must be uncompressed UTF-8',
+      });
+      return;
+    }
+
+    if (res.locals.expectContinue === true) res.writeContinue();
+    const bytes = await readBody(req, {
+      length: req.headers['content-length'] ?? null,
+      limit: JSON_LIMIT_BYTES,
+    });
+    if (bytes.length === 0) {
+      res.json({ message: 'Payload accepted', data: null });
+      return;
+    }
+    const text = isUtf8(bytes) ? utf8.decode(bytes) : '';
+    if (!isJsonContainer(text)) {
+      res
+        .status(400)
+        .json({ error: 'INVALID_JSON', message: 'Expected a UTF-8 JSON object or array' });
+      return;
+    }
+
+    // Embed the validated JSON value without rounding numbers or reserializing deeply nested data.
+    res.type('application/json').send(`{"message":"Payload accepted","data":${text}}`);
   });
 
   app.use((_req, res) => {
@@ -54,23 +120,12 @@ export function createApp(config: AppConfig, now?: () => number) {
     const type = error instanceof Error && 'type' in error ? error.type : undefined;
     switch (type) {
       case 'entity.too.large':
-        res
-          .status(413)
-          .json({ error: 'PAYLOAD_TOO_LARGE', message: 'JSON payload exceeds 16 KiB' });
-        break;
-      case 'entity.parse.failed':
-        res.status(400).json({ error: 'INVALID_JSON', message: 'Malformed JSON request body' });
+        res.set('Connection', 'close');
+        payloadTooLarge(res);
         break;
       case 'request.aborted':
       case 'request.size.invalid':
         res.status(400).json({ error: 'INVALID_REQUEST_BODY', message: 'Invalid request body' });
-        break;
-      case 'charset.unsupported':
-      case 'encoding.unsupported':
-        res.status(415).json({
-          error: 'UNSUPPORTED_BODY_ENCODING',
-          message: 'Unsupported JSON charset or content encoding',
-        });
         break;
       default:
         console.error('Unhandled request error');

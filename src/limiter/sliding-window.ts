@@ -19,6 +19,7 @@ export type RateLimitDecision =
 interface Bucket {
   key: string;
   timestamps: number[];
+  latest: number;
   previous: Bucket | null;
   next: Bucket | null;
 }
@@ -59,10 +60,18 @@ export class SlidingWindowLimiter {
     if (!key.trim()) throw new TypeError('Rate-limit key must be non-empty');
 
     const time = this.readTime();
+    // Comparing timestamps to the cutoff preserves values just above zero
+    // that would round away if subtracted from a much larger current time.
+    const cutoff = time - this.windowMs;
     let bucket = this.buckets.get(key);
-    if (bucket === undefined && this.buckets.size >= this.maxTrackedClients) {
-      if (this.oldest === null || !this.isExpired(this.oldest, time)) {
-        return { kind: 'capacity_exceeded', retryAfterMs: 1000 };
+    if (
+      bucket === undefined &&
+      this.oldest !== null &&
+      this.buckets.size >= this.maxTrackedClients
+    ) {
+      const release = this.oldest.latest - cutoff;
+      if (release > 0) {
+        return { kind: 'capacity_exceeded', retryAfterMs: Math.min(this.windowMs, release) };
       }
       this.remove(this.oldest);
     }
@@ -70,24 +79,31 @@ export class SlidingWindowLimiter {
     const timestamps = bucket?.timestamps ?? [];
     let expired = 0;
     for (const timestamp of timestamps) {
-      if (time - timestamp < this.windowMs) break;
+      if (timestamp > cutoff) break;
       expired++;
     }
     if (expired > 0) timestamps.splice(0, expired);
 
-    const resetAfterMs = this.windowMs - (time - (timestamps[0] ?? time));
+    const oldestTimestamp = timestamps[0];
+    const resetAfterMs =
+      oldestTimestamp === undefined
+        ? this.windowMs
+        : Math.min(this.windowMs, oldestTimestamp - cutoff);
     if (timestamps.length === this.maxRequests) {
       return { kind: 'rate_limited', limit: this.maxRequests, remaining: 0, resetAfterMs };
     }
 
     timestamps.push(time);
     if (bucket === undefined) {
-      bucket = { key, timestamps, previous: null, next: null };
+      bucket = { key, timestamps, latest: time, previous: null, next: null };
       this.buckets.set(key, bucket);
       this.append(bucket);
-    } else if (bucket !== this.newest) {
-      this.unlink(bucket);
-      this.append(bucket);
+    } else {
+      bucket.latest = time;
+      if (bucket !== this.newest) {
+        this.unlink(bucket);
+        this.append(bucket);
+      }
     }
     return {
       kind: 'allowed',
@@ -97,11 +113,14 @@ export class SlidingWindowLimiter {
     };
   }
 
-  /** Reclaims only the expired prefix, ordered by most recent acceptance. */
-  sweep(): number {
-    const time = this.readTime();
+  /** Reclaims up to maxBuckets entries from the fully expired prefix. */
+  sweep(maxBuckets = this.maxTrackedClients): number {
+    if (!Number.isSafeInteger(maxBuckets) || maxBuckets < 1) {
+      throw new RangeError('Sweep batch size must be a positive safe integer');
+    }
+    const cutoff = this.readTime() - this.windowMs;
     let removed = 0;
-    while (this.oldest !== null && this.isExpired(this.oldest, time)) {
+    while (removed < maxBuckets && this.oldest !== null && this.oldest.latest <= cutoff) {
       this.remove(this.oldest);
       removed++;
     }
@@ -122,12 +141,6 @@ export class SlidingWindowLimiter {
     // A regressed sample cannot move accepted timestamps into the future.
     this.lastTime = Math.max(this.lastTime, sample);
     return this.lastTime;
-  }
-
-  private isExpired(bucket: Bucket, time: number): boolean {
-    // Every tracked bucket has an accepted timestamp.
-    const latest = bucket.timestamps.at(-1);
-    return latest !== undefined && time - latest >= this.windowMs;
   }
 
   private append(bucket: Bucket): void {

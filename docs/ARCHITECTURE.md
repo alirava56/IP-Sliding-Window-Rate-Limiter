@@ -10,12 +10,13 @@ flowchart LR
   IP -->|Canonical key| Limiter["Sliding-window log"]
   Limiter -->|Quota full| Limited["429 + Retry-After"]
   Limiter -->|Store full for new key| Capacity["503 + Retry-After"]
-  Limiter -->|Allowed| JSON["Bounded JSON parser"]
-  JSON -->|Malformed JSON| Bad
-  JSON -->|Oversize or unsupported encoding| Payload["413 or 415"]
-  JSON -->|Valid or absent| Handler["API handler"]
-  Handler -->|Known route| Success["200 JSON"]
+  Limiter -->|Allowed| Handler["Route selection"]
+  Handler -->|POST /api/echo| JSON["Bounded UTF-8 body reader"]
+  Handler -->|GET /api/demo| Success["200 JSON"]
   Handler -->|Unknown route| Missing
+  JSON -->|Invalid JSON or UTF-8| Bad
+  JSON -->|Oversize or unsupported input| Payload["413 or 415"]
+  JSON -->|Valid or absent| Success
 ```
 
 ## ADR 001 — Exact acceptance log in one process
@@ -24,13 +25,13 @@ The limiter stores one timestamp per admitted request and applies the interval `
 
 This log avoids the boundary burst of fixed counters and estimation error of interpolated sliding counters. A synchronous in-process Map keeps the state transition within one event-loop turn. Parallel HTTP handlers in one process cannot interleave between reading and recording a decision. Each worker, container and replica owns its own store.
 
-Production samples come from monotonic `performance.now()`, which measures elapsed milliseconds independent of wall-clock adjustments. The injected clock supports fractional samples and must return finite nonnegative values through `Number.MAX_SAFE_INTEGER`. The limiter freezes at the previous high-water mark during a regression and resumes expiration when time advances. Invalid values throw before changing state. A forward jump expires entries according to the elapsed interval. State and the clock watermark are process-local.
+Production samples come from monotonic `performance.now()`, which measures elapsed milliseconds independent of wall-clock adjustments. The injected clock supports fractional samples and must return finite nonnegative values through `Number.MAX_SAFE_INTEGER`. The limiter compares stored timestamps directly with the cutoff `t - windowMs`. Subtracting a tiny timestamp from a much larger current time can round the age up to the expiration boundary. The limiter freezes at the previous high-water mark during a regression and resumes expiration when time advances. Invalid values throw before changing state. A forward jump expires entries according to the elapsed interval. State and the clock watermark are process-local.
 
 ## ADR 002 — Bound state and preserve active buckets
 
-Each array stores up to Q timestamps, and the Map tracks up to K keys. The constructor and environment validation cap the product at 1,000,000. A retained bucket can contain expired prefix entries until its next check. A periodic sweep, scheduled at the smaller of one window or 60 seconds, reclaims fully expired idle buckets.
+Each array stores up to Q timestamps, and the Map tracks up to K keys. The constructor and environment validation cap the product at 1,000,000. A retained bucket can contain expired prefix entries until its next check. Background cleanup starts at the smaller of one window or 60 seconds. Each timer callback removes at most 1,024 fully expired buckets. A full batch schedules another timer on a subsequent turn, letting HTTP I/O run between batches.
 
-A doubly linked list orders the same buckets by their latest accepted request. The earliest bucket expires first because the window is the same for every key and accepted times are nondecreasing. An acceptance moves the bucket to the end. A direct pointer to the oldest bucket avoids the cost of restarting Map iteration after successive deletions. At capacity, a new IP reclaims one expired oldest bucket or receives `503` with a short retry hint. Reclaiming active buckets would discard the history that enforces the quota. Existing keys remain eligible for normal quota decisions while the store is full.
+A doubly linked list orders the same buckets by their latest accepted request. The earliest bucket expires first because the window is the same for every key and accepted times are nondecreasing. An acceptance moves the bucket to the end. A direct pointer to the oldest bucket avoids the cost of restarting Map iteration after successive deletions. At capacity, a new IP reclaims one expired oldest bucket or receives `503` with the time until the first bucket could expire. Reclaiming active buckets would discard the history that enforces the quota. Existing keys remain eligible for normal quota decisions while the store is full.
 
 | Operation                                                                  | Expected cost                                |
 | -------------------------------------------------------------------------- | -------------------------------------------- |
@@ -40,7 +41,7 @@ A doubly linked list orders the same buckets by their latest accepted request. T
 | Sweep E fully expired buckets                                              | Amortized O(E + 1), bounded by K             |
 | Retained state                                                             | O(K + KQ), plus per-request runtime overhead |
 
-Deletion makes expired arrays eligible for garbage collection. Allocation and Map resizing, the cost of a large synchronous sweep, Node heap usage, and concurrent HTTP traffic still depend on load and the runtime. The budget limits logical slots.
+Deletion makes expired arrays eligible for garbage collection. Allocation, Map resizing, Node heap usage, and concurrent HTTP traffic still depend on load and the runtime. The budget limits logical slots.
 
 ## ADR 003 — Resolve identity at the network trust boundary
 
@@ -50,9 +51,9 @@ Equivalent IPv6 spellings collapse to the same key. IPv4-mapped IPv6 and native 
 
 ## ADR 004 — Keep liveness independent of quota
 
-`GET /health` reports process liveness with a constant payload and avoids the parser and quota store. It remains available when an API quota or the store itself is exhausted. All `/api` requests share the IP quota. Limiting before parsing protects CPU and limits accepted traffic across routes. The JSON parser caps buffered JSON at 16 KiB and accepts identity encoding. Node applies 10-second header and 30-second request deadlines separately from application processing.
+`GET /health` reports process liveness with a constant payload and avoids the body reader and quota store. It remains available when an API quota or the store itself is exhausted. All `/api` requests share the IP quota. Only the echo route reads JSON. It checks declared size, content type and encoding before inviting a client to continue, and stops buffering chunked uploads on overflow. After validating UTF-8 and JSON syntax, it embeds the original JSON value so large numbers and deep containers survive intact. Node applies 10-second header and 30-second request deadlines separately from application processing.
 
-On `SIGINT` or `SIGTERM`, the server stops sweeping and closes the listener. Active requests have up to ten seconds to finish. Finished keep-alive connections are reclaimed during the drain. On timeout the service closes remaining HTTP connections and exits nonzero. Repeated signals share the in-progress shutdown operation.
+On `SIGINT` or `SIGTERM`, the server stops sweeping and closes the listener. Requests received after shutdown starts get `503` and `Connection: close` if they reach the handler on an existing connection. Previously admitted requests have up to ten seconds to finish. Finished keep-alive connections are reclaimed during the drain. On timeout the service closes remaining HTTP connections and exits nonzero. Repeated signals share the in-progress shutdown operation.
 
 ## Shared-store migration
 

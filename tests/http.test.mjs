@@ -149,20 +149,28 @@ test('unknown paths return JSON 404, without exposing Express details', async ()
 
 test('capacity exhaustion is a 503, never silent quota bypass', async () => {
   await withServer(
-    { maxRequests: 1, maxTrackedClients: 1, trustedProxyCidrs: ['127.0.0.1/32'] },
-    async (origin) => {
+    { maxRequests: 1, maxTrackedClients: 1, windowMs: 1550, trustedProxyCidrs: ['127.0.0.1/32'] },
+    async (origin, tick) => {
       assert.equal(
         (await fetch(`${origin}/api/demo`, { headers: { 'X-Forwarded-For': '192.0.2.2' } })).status,
         200,
       );
-      const response = await fetch(`${origin}/api/demo`, {
-        headers: { 'X-Forwarded-For': '192.0.2.3' },
-      });
+      const requestNew = () =>
+        fetch(`${origin}/api/demo`, {
+          headers: { 'X-Forwarded-For': '192.0.2.3' },
+        });
+      const response = await requestNew();
       assert.equal(response.status, 503);
-      assert.equal(response.headers.get('retry-after'), '1');
+      assert.equal(response.headers.get('retry-after'), '2');
       assert.equal(response.headers.get('ratelimit-limit'), null);
       assert.equal(response.headers.get('cache-control'), 'no-store');
       assert.equal((await response.json()).error, 'RATE_LIMITER_CAPACITY');
+      tick(551);
+      const retry = await requestNew();
+      assert.equal(retry.status, 503);
+      assert.equal(retry.headers.get('retry-after'), '1');
+      tick(1550);
+      assert.equal((await requestNew()).status, 200);
     },
   );
 });
@@ -282,5 +290,77 @@ test('a limiter failure returns a cache-controlled 500 with a generic body and l
       log.mock.calls.map((call) => call.arguments),
       [['Unhandled request error']],
     );
+  });
+});
+
+test('echo rejects unsupported media types and gives every empty body the same result', async () => {
+  await withServer({ maxRequests: 4 }, async (origin) => {
+    for (const headers of [{}, { 'Content-Type': 'application/json' }]) {
+      const empty = await fetch(`${origin}/api/echo`, { method: 'POST', headers });
+      assert.equal(empty.status, 200);
+      assert.deepEqual(await empty.json(), { message: 'Payload accepted', data: null });
+    }
+    const wrongType = await fetch(`${origin}/api/echo`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'text/plain' },
+      body: '{}',
+    });
+    assert.equal(wrongType.status, 415);
+    assert.equal((await wrongType.json()).error, 'UNSUPPORTED_MEDIA_TYPE');
+    const wrongCharset = await fetch(`${origin}/api/echo`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json; charset=utf-16le' },
+      body: Buffer.from('{}', 'utf16le'),
+    });
+    assert.equal(wrongCharset.status, 415);
+    assert.equal((await wrongCharset.json()).error, 'UNSUPPORTED_BODY_ENCODING');
+  });
+});
+
+test('echo rejects invalid UTF-8 and JSON scalars', async () => {
+  await withServer({}, async (origin) => {
+    const invalid = Buffer.concat([
+      Buffer.from('{"value":"'),
+      Buffer.from([0xc3]),
+      Buffer.from('"}'),
+    ]);
+    for (const body of [invalid, 'null']) {
+      const reply = await fetch(`${origin}/api/echo`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body,
+      });
+      assert.equal(reply.status, 400);
+      assert.equal((await reply.json()).error, 'INVALID_JSON');
+    }
+  });
+});
+
+test('echo preserves JSON numbers and deeply nested values within its size limit', async () => {
+  await withServer({}, async (origin) => {
+    const nested = '['.repeat(7000) + '0' + ']'.repeat(7000);
+    const body = `{"value":9007199254740993,"exponent":1e400,"nested":${nested}}`;
+    const reply = await fetch(`${origin}/api/echo`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json; charset="UTF-8"' },
+      body,
+    });
+    assert.equal(reply.status, 200);
+    assert.equal(reply.headers.get('content-type'), 'application/json; charset=utf-8');
+    assert.equal(await reply.text(), `{"message":"Payload accepted","data":${body}}`);
+  });
+});
+
+test('unknown API paths keep their 404 response and still participate in the quota', async () => {
+  await withServer({ maxRequests: 1 }, async (origin) => {
+    const reply = await fetch(`${origin}/api/missing`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: '{incomplete',
+    });
+    assert.equal(reply.status, 404);
+    assert.equal(reply.headers.get('ratelimit-remaining'), '0');
+    assert.equal((await reply.json()).error, 'NOT_FOUND');
+    assert.equal((await fetch(`${origin}/api/demo`)).status, 429);
   });
 });

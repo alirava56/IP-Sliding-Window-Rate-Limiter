@@ -34,7 +34,7 @@ Express identifies the network peer or walks a trusted proxy chain, normalizes t
 
 For time `t`, the active interval is **`(t - windowMs, t]`**. The limiter expires timestamps at or before the lower boundary, rejects if the quota is full, and appends `t` exactly once on acceptance. Rejections leave the log and retry boundary unchanged. For a 2-request, 1000 ms window, requests at 0 ms and 500 ms succeed, a request at 999 ms is blocked, and a request at 1000 ms can take the expired slot.
 
-The log makes the exact quota and the earliest slot release computable from the same data. Timestamp storage costs up to `K × Q` slots for `K` tracked keys and `Q` requests per key. Checks without partial expiration take expected amortized O(1) time. Pruning an array takes O(Q) in the worst case. A full store checks its oldest bucket in expected amortized O(1). A sweep of E expired buckets visits those buckets and at most one active bucket. The configured slot budget bounds stored timestamps. Heap usage also depends on Maps, key lengths, arrays, the runtime and HTTP connections.
+The log makes the exact quota and the earliest slot release computable from the same data. Timestamp storage costs up to `K × Q` slots for `K` tracked keys and `Q` requests per key. Checks without partial expiration take expected amortized O(1) time. Pruning an array takes O(Q) in the worst case. A full store checks its oldest bucket in expected amortized O(1). Background cleanup removes up to 1,024 expired buckets per timer callback and yields between batches. The configured slot budget bounds stored timestamps. Heap usage also depends on Maps, key lengths, arrays, the runtime and HTTP connections.
 
 [Architecture and design decisions](docs/ARCHITECTURE.md)
 
@@ -65,13 +65,13 @@ Earlier releases used `TRUST_PROXY_HOPS`. A positive hop count trusts request pa
 
 ## HTTP API
 
-| Method | Path        | Result                                                    |
-| ------ | ----------- | --------------------------------------------------------- |
-| `GET`  | `/health`   | Basic liveness JSON, exempt from quota                    |
-| `GET`  | `/api/demo` | Acceptance message and canonical client IP                |
-| `POST` | `/api/echo` | Echoes an `application/json` object or array up to 16 KiB |
+| Method | Path        | Result                                                                       |
+| ------ | ----------- | ---------------------------------------------------------------------------- |
+| `GET`  | `/health`   | Basic liveness JSON, exempt from quota                                       |
+| `GET`  | `/api/demo` | Acceptance message and canonical client IP                                   |
+| `POST` | `/api/echo` | Echoes an uncompressed UTF-8 `application/json` object or array up to 16 KiB |
 
-The quota counts requests admitted to the `/api` pipeline, including downstream JSON errors and unknown API paths. A missing body yields `data: null`, as does a body with a media type outside the JSON parser. The service accepts uncompressed JSON and returns `415` for unsupported JSON charset or content encoding. Every Express response carries `Cache-Control: no-store`.
+The quota counts requests admitted to the `/api` pipeline, including downstream JSON errors and unknown API paths. An empty echo body yields `data: null`. For a nonempty body, the echo route rejects unsupported media types, charsets and content encodings with `415`, and preserves the validated JSON value without rounding numeric literals during serialization. It enforces 16 KiB for both declared-length and chunked uploads. The HTTP listener sends `100 Continue` only after the echo request passes admission and header validation. Every Express response carries `Cache-Control: no-store`.
 
 ```http
 GET /api/demo HTTP/1.1
@@ -99,12 +99,12 @@ Retry-After: 58
 {"error":"TOO_MANY_REQUESTS","message":"Rate limit exceeded. Please retry later."}
 ```
 
-| Header                | Meaning                                                                                                                     |
-| --------------------- | --------------------------------------------------------------------------------------------------------------------------- |
-| `RateLimit-Limit`     | Maximum accepted requests per rolling window                                                                                |
-| `RateLimit-Remaining` | Available slots immediately after the decision                                                                              |
-| `RateLimit-Reset`     | Delta seconds until the oldest active timestamp expires, rounded up. Slots recover as individual timestamps age out.        |
-| `Retry-After`         | On `429`, the same delta as reset. On capacity `503`, a one-second retry hint with admission subject to available capacity. |
+| Header                | Meaning                                                                                                                                                             |
+| --------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `RateLimit-Limit`     | Maximum accepted requests per rolling window                                                                                                                        |
+| `RateLimit-Remaining` | Available slots immediately after the decision                                                                                                                      |
+| `RateLimit-Reset`     | Delta seconds until the oldest active timestamp expires, rounded up. Slots recover as individual timestamps age out.                                                |
+| `Retry-After`         | On `429`, the same delta as reset. On capacity `503`, the seconds until the first bucket could expire, rounded up. Later accepted traffic may change that estimate. |
 
 The three `RateLimit-*` fields are this service's compatibility contract. Clients can use the standard delay-seconds form of `Retry-After`. Shared traffic may consume a slot before a retry arrives. [HTTP Retry-After](https://www.rfc-editor.org/rfc/rfc9110.html#name-retry-after) · [IETF RateLimit work](https://datatracker.ietf.org/doc/draft-ietf-httpapi-ratelimit-headers/)
 
@@ -132,7 +132,7 @@ docker build -t ip-sliding-window-limiter .
 docker run --rm --stop-timeout 12 -p 127.0.0.1:3000:3000 ip-sliding-window-limiter
 ```
 
-The image uses a digest-pinned Node 24 Alpine base and runs Node as the non-root `node` user with only production dependencies. The service drains active HTTP connections for up to ten seconds after a shutdown signal. Allow the container runtime enough time to deliver the signal and let the process drain.
+The image uses a digest-pinned Node 24 Alpine base and runs Node as the non-root `node` user with only production dependencies. After a shutdown signal, the service closes its listener, refuses new requests on existing connections with `503`, and gives previously admitted requests up to ten seconds to finish. Allow the container runtime enough time to deliver the signal and let the process drain.
 
 ## Benchmarks
 
@@ -140,7 +140,7 @@ The image uses a digest-pinned Node 24 Alpine base and runs Node as the non-root
 npm run bench
 ```
 
-The script reports throughput, p50/p95/p99 latency, CPU time, tracked clients, and before/after heap and RSS snapshots. In one local Windows run on Node 24.22.3, 2,000 loopback requests at concurrency 16 produced 1,000 responses of each status, `200` and `429`. Throughput was 3,941 requests/s with p95 of 8.00 ms. The core scenarios each ran 100,000 decisions across repeated clients, independent keys, full capacity and expiration. [Environment, measurements and limitations](docs/verification/FINAL-REPORT.md#performance)
+The script reports throughput, p50/p95/p99 latency, CPU time, tracked clients, and before/after heap and RSS snapshots. In one local Windows run on Node 24.22.3, 2,000 loopback requests at concurrency 16 produced 1,000 responses of each status, `200` and `429`. Throughput was 4,499 requests/s with p95 of 7.35 ms. The core scenarios each ran 100,000 decisions across repeated clients, independent keys, full capacity and expiration. [Environment, measurements and limitations](docs/verification/FINAL-REPORT.md#performance)
 
 ## Deployment scope and future work
 

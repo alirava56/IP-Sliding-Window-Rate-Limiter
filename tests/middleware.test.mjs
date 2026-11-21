@@ -70,7 +70,7 @@ test('capacity exhaustion returns a 503 with Retry-After', () => {
   assert.equal(invoke(l, '192.0.2.1').nextCount, 1);
   const response = invoke(l, '192.0.2.2');
   assert.equal(response.res.statusCode, 503);
-  assert.equal(response.headers.get('retry-after'), '1');
+  assert.equal(response.headers.get('retry-after'), '60');
 });
 
 test('equivalent address spellings and socket fallback share the same bucket', () => {

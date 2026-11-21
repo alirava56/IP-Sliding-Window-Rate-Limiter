@@ -1,9 +1,10 @@
-import { createServer } from 'node:http';
+import { createServer, type IncomingMessage, type ServerResponse } from 'node:http';
 import { createApp } from './app';
 import { loadConfig, type AppConfig } from './config';
 
 const SHUTDOWN_GRACE_MS = 10_000;
 const MAX_SWEEP_INTERVAL_MS = 60_000;
+const SWEEP_BATCH_SIZE = 1024;
 
 export function startServer(
   config: AppConfig,
@@ -13,27 +14,47 @@ export function startServer(
   let stopping: Promise<void> | undefined;
   const server = createServer(
     { headersTimeout: 10_000, requestTimeout: 30_000, connectionsCheckingInterval: 1000 },
-    (request, response) => {
-      response.once('finish', () => {
-        if (stopping !== undefined) {
-          // By the next turn, Node has marked the finished connection idle.
-          setImmediate(() => server.closeIdleConnections()).unref();
-        }
+    handleRequest,
+  );
+  server.on('checkContinue', (request, response) => {
+    // The echo handler sends Continue after quota and header validation.
+    handleRequest(request, Object.assign(response, { locals: { expectContinue: true } }));
+  });
+
+  function handleRequest(request: IncomingMessage, response: ServerResponse): void {
+    if (stopping !== undefined) {
+      response.writeHead(503, {
+        'Cache-Control': 'no-store',
+        'Content-Type': 'application/json; charset=utf-8',
+        Connection: 'close',
       });
-      app(request, response);
-    },
-  );
+      response.end('{"error":"SERVICE_SHUTTING_DOWN","message":"Server is shutting down"}');
+      return;
+    }
+    response.once('finish', () => {
+      if (stopping !== undefined) {
+        // By the next turn, Node has marked the finished connection idle.
+        setImmediate(() => server.closeIdleConnections()).unref();
+      }
+    });
+    app(request, response);
+  }
+
+  const sweepIntervalMs = Math.min(config.windowMs, MAX_SWEEP_INTERVAL_MS);
+  let sweep: NodeJS.Timeout | undefined;
+  function scheduleSweep(delay: number): void {
+    sweep = setTimeout(() => {
+      const removed = limiter.sweep(SWEEP_BATCH_SIZE);
+      scheduleSweep(removed === SWEEP_BATCH_SIZE ? 1 : sweepIntervalMs);
+    }, delay).unref();
+  }
+  server.once('listening', () => scheduleSweep(sweepIntervalMs));
+  server.once('close', () => clearTimeout(sweep));
   server.listen({ port: config.port, host });
-  const sweep = setInterval(
-    () => limiter.sweep(),
-    Math.min(config.windowMs, MAX_SWEEP_INTERVAL_MS),
-  );
-  sweep.unref();
-  server.once('close', () => clearInterval(sweep));
 
   function shutdown(): Promise<void> {
     stopping ??= new Promise((resolve, reject) => {
-      clearInterval(sweep);
+      clearTimeout(sweep);
       let forced = false;
       const deadline = setTimeout(() => {
         forced = true;
