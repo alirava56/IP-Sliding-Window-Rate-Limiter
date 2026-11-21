@@ -1,91 +1,80 @@
+<div dir="rtl">
+
 # IP Sliding Window Rate Limiter
 
-An Express 5 service and TypeScript middleware that enforce an exact rolling quota per client IP. A fixed window can admit back-to-back bursts at its boundary. This limiter keeps an acceptance log so the quota applies to every rolling interval.
+**محدودکنندهٔ نرخ درخواست HTTP به‌ازای هر IP برای Express** با الگوریتم پنجرهٔ لغزان. با تنظیمات پیش‌فرض، سرویس برای هر IP در هر بازهٔ لغزان ۶۰ ثانیه‌ای حداکثر ۱۰ درخواست به مسیرهای `/api` را می‌پذیرد. وقتی سهمیه پر شود، API پاسخ `429` را همراه با زمان پیشنهادی تلاش مجدد برمی‌گرداند.
 
-- Shared quota across `/api` routes with actionable `429` response headers.
-- Canonical IPv4 and IPv6 identities and explicit reverse-proxy trust.
-- Bounded in-memory state with an explicit `503` policy at capacity.
-- Deterministic Node.js tests, a standalone smoke check, and a multi-stage Docker image.
+این پروژه برای کنترل درخواست‌های پرتکرار، مثل polling یا retryهای پی‌درپی، مناسب است. هم می‌توانید آن را به‌عنوان یک سرویس نمونه اجرا کنید، هم می‌توانید کد middleware را برای افزودن محدودیت به یک سرویس Express بررسی کنید.
 
-[راهنمای نصب و انتشار در ویندوز](SETUP-FA.md)
+[شروع سریع](#شروع-سریع) · [رابط HTTP](#رابط-http) · [تنظیمات](#تنظیمات) · [Docker](#اجرا-با-docker) · [آزمون‌ها](#آزمون-و-سنجش-کارایی)
 
-## Quick start
+## امکانات
 
-Use the latest patched Node.js 22 or 24 release and its bundled npm. The baseline for this release is Node.js 22.23.5 or 24.22.3 on the corresponding major line.
+- **سهمیهٔ مشترک مسیرهای API** برای هر IP، همراه با هدرهای سهمیه و `Retry-After`. مسیر `/health` از این محدودیت معاف است.
+- **پشتیبانی از IPv4 و IPv6** با یکسان‌سازی شکل‌های معادل نشانی. کلاینت مستقیم با IP اتصال TCP شناسایی می‌شود و اعتماد به پراکسی با فهرست مجاز فعال می‌شود.
+- **وضعیت در حافظه با ظرفیت محدود** و پاک‌سازی دسته‌ای ورودی‌های منقضی. در ظرفیت کامل، درخواست از IP تازه با `503` پاسخ می‌گیرد و سابقهٔ IPهای فعال حفظ می‌شود.
+- **اعتبارسنجی بدنه و خاموشی کنترل‌شده** با سقف ۱۶ KiB برای JSON در مسیر نمونه و فرصت تکمیل درخواست‌های پذیرفته‌شده هنگام خاموشی.
+
+## زبان‌ها و ابزارها
+
+| فناوری                         | کاربرد در پروژه                                                                          |
+| ------------------------------ | ---------------------------------------------------------------------------------------- |
+| TypeScript                     | زبان اصلی کد سرور، الگوریتم محدودکننده، middleware و اعتبارسنجی تنظیمات                  |
+| JavaScript با فایل‌های `.mjs`  | آزمون‌ها، آزمون دود و سنجش کارایی                                                        |
+| Node.js 22 و 24 و Express 5    | محیط اجرا، ساخت سرور HTTP و مسیریابی                                                     |
+| `ipaddr.js`                    | یکسان‌سازی نشانی‌های IP و تشخیص IPv4 نگاشته‌شده در IPv6                                  |
+| `content-type` و `raw-body`    | اعتبارسنجی نوع محتوا و خواندن بدنه با سقف اندازه                                         |
+| `node:test`، ESLint و Prettier | آزمون، تحلیل ایستا و یکدستی قالب کد                                                      |
+| Docker و GitHub Actions        | بسته‌بندی سرویس و بررسی خودکار کد روی دو نسخهٔ Node.js. تنظیمات CI با YAML نوشته شده‌اند. |
+
+## شروع سریع
+
+**پیش‌نیاز:** Git و npm همراه با نسخهٔ به‌روز Node.js از شاخهٔ ۲۲ یا ۲۴. حداقل نسخه برای شاخهٔ ۲۲، `22.23.5` و برای شاخهٔ ۲۴، `24.22.3` است.
+
+<div dir="ltr">
 
 ```sh
+git clone https://github.com/alirava56/IP-Sliding-Window-Rate-Limiter.git
+cd IP-Sliding-Window-Rate-Limiter
 npm ci
 npm run dev
 ```
 
-In another terminal, make a health request and an API request.
+</div>
+
+سرویس به‌صورت پیش‌فرض روی پورت `3000` بالا می‌آید. در ترمینال دیگری مسیرهای نمونه را فراخوانی کنید.
+
+<div dir="ltr">
 
 ```sh
 curl -i http://localhost:3000/health
 curl -i http://localhost:3000/api/demo
-curl -i http://localhost:3000/api/echo -H 'Content-Type: application/json' -d '{"hello":"world"}'
+curl -i -H 'Content-Type: application/json' --data '{"hello":"world"}' http://localhost:3000/api/echo
 ```
 
-Each IP gets 10 API requests per 60 seconds by default. For the compiled service, use `npm run build` and then `npm start`. The standalone `npm run smoke` command builds and starts its own loopback listener and checks for 10 successes and two `429` responses.
+</div>
 
-## Architecture and algorithm
+برای اجرای نسخهٔ کامپایل‌شده، `npm run build` و سپس `npm start` را اجرا کنید. در PowerShell می‌توانید از `npm.cmd` استفاده کنید. [راهنمای ویندوز](SETUP-FA.md)
 
-Express identifies the network peer or walks a trusted proxy chain, normalizes the resulting address, and calls the synchronous limiter before parsing JSON or invoking a handler. A process-local Map stores a timestamp array per canonical IP.
+برای مشاهدهٔ خودکار پاسخ‌های `200` و `429`، دستور `npm run smoke` یک سرور موقت روی پورت آزاد اجرا می‌کند.
 
-For time `t`, the active interval is **`(t - windowMs, t]`**. The limiter expires timestamps at or before the lower boundary, rejects if the quota is full, and appends `t` exactly once on acceptance. Rejections leave the log and retry boundary unchanged. For a 2-request, 1000 ms window, requests at 0 ms and 500 ms succeed, a request at 999 ms is blocked, and a request at 1000 ms can take the expired slot.
+## پنجره لغزان چگونه کار می‌کند؟
 
-The log makes the exact quota and the earliest slot release computable from the same data. Timestamp storage costs up to `K × Q` slots for `K` tracked keys and `Q` requests per key. Checks without partial expiration take expected amortized O(1) time. Pruning an array takes O(Q) in the worst case. A full store checks its oldest bucket in expected amortized O(1). Background cleanup removes up to 1,024 expired buckets per timer callback and yields between batches. The configured slot budget bounds stored timestamps. Heap usage also depends on Maps, key lengths, arrays, the runtime and HTTP connections.
+سرویس زمان هر درخواست **پذیرفته‌شده** را برای IP آن ثبت می‌کند. هنگام رسیدن درخواست در زمان `t`، فقط زمان‌های داخل بازهٔ `(t - windowMs, t]` در سهمیه حساب می‌شوند. اگر هنوز جا باشد، درخواست پذیرفته و زمان آن ثبت می‌شود. در غیر این صورت، سرور `429` می‌دهد و زمان درخواست ردشده را ثبت نمی‌کند.
 
-[Architecture and design decisions](docs/ARCHITECTURE.md)
+مثلاً با سهمیهٔ دو درخواست در ۱٬۰۰۰ میلی‌ثانیه، درخواست‌های زمان صفر و ۵۰۰ پذیرفته می‌شوند، درخواست در ۹۹۹ رد می‌شود و درخواست در ۱٬۰۰۰ جای درخواست منقضی‌شدهٔ زمان صفر را می‌گیرد. به این ترتیب سهمیه با گذشت زمان هر درخواست آزاد می‌شود. [جزئیات معماری و پیچیدگی الگوریتم](docs/ARCHITECTURE.md)
 
-## Configuration
+## رابط HTTP
 
-Set environment variables before starting Node. `.env.example` shows the supported values. For Docker, pass overrides explicitly with `--env-file`.
+| روش    | مسیر        | رفتار                                                                                                       |
+| ------ | ----------- | ----------------------------------------------------------------------------------------------------------- |
+| `GET`  | `/health`   | وضعیت زنده بودن پردازش، بدون مصرف سهمیه                                                                     |
+| `GET`  | `/api/demo` | پیام پذیرش و IP یکسان‌سازی‌شدهٔ کلاینت                                                                       |
+| `POST` | `/api/echo` | برگرداندن شیء یا آرایهٔ JSON با UTF-8، بدون فشرده‌سازی و تا سقف ۱۶ KiB. بدنهٔ خالی مقدار `data: null` می‌دهد. |
 
-| Variable                  | Default | Valid values                                                  |
-| ------------------------- | ------: | ------------------------------------------------------------- |
-| `PORT`                    |  `3000` | Integer 1–65,535                                              |
-| `RATE_LIMIT_WINDOW_MS`    | `60000` | Integer 100–3,600,000 ms                                      |
-| `RATE_LIMIT_MAX_REQUESTS` |    `10` | Integer 1–10,000                                              |
-| `MAX_TRACKED_IPS`         | `10000` | Integer 1–1,000,000                                           |
-| `TRUSTED_PROXY_CIDRS`     |   Empty | Up to 32 comma-separated literal IPv4/IPv6 addresses or CIDRs |
+درخواست‌هایی که از محدودکنندهٔ مسیر `/api` عبور می‌کنند سهمیه مصرف می‌کنند، حتی اگر بعداً پاسخ `404` یا خطای اعتبارسنجی بگیرند. بدنهٔ نامعتبر با `400`، بدنهٔ بزرگ‌تر از سقف با `413` و نوع محتوا یا کدگذاری پشتیبانی‌نشده با `415` پاسخ داده می‌شود.
 
-Numeric settings use decimal digits without a sign, leading zeroes or whitespace. The product of `RATE_LIMIT_MAX_REQUESTS` and `MAX_TRACKED_IPS` must be at most 1,000,000. Invalid settings fail startup. PowerShell example:
-
-```powershell
-$env:RATE_LIMIT_MAX_REQUESTS = '3'
-npm.cmd run dev
-```
-
-### Reverse-proxy trust
-
-An empty allowlist uses the socket peer's IP and ignores `X-Forwarded-For`. Set `TRUSTED_PROXY_CIDRS` to the actual source addresses or dedicated subnets of proxies you operate. For example, `127.0.0.1/32` identifies a reverse proxy on IPv4 loopback when that listener is isolated from untrusted local processes. Keep the application listener behind the proxy using network access controls and have the edge overwrite inbound forwarding headers. Each trusted downstream proxy must preserve an accurate chain. Express walks from the socket peer toward the client and stops at the nearest untrusted address.
-
-Earlier releases used `TRUST_PROXY_HOPS`. A positive hop count trusts request paths by length, so a shorter or direct path can let a public connection be treated as a proxy. Replace any positive setting with the explicit allowlist. The legacy literal `0` is accepted during migration. Simulated proxy tests verify application behavior. Deployment owners must verify the actual peers and forwarding rules. [Express proxy guidance](https://expressjs.com/en/guide/behind-proxies/) · [Security policy](docs/SECURITY.md)
-
-## HTTP API
-
-| Method | Path        | Result                                                                       |
-| ------ | ----------- | ---------------------------------------------------------------------------- |
-| `GET`  | `/health`   | Basic liveness JSON, exempt from quota                                       |
-| `GET`  | `/api/demo` | Acceptance message and canonical client IP                                   |
-| `POST` | `/api/echo` | Echoes an uncompressed UTF-8 `application/json` object or array up to 16 KiB |
-
-The quota counts requests admitted to the `/api` pipeline, including downstream JSON errors and unknown API paths. An empty echo body yields `data: null`. For a nonempty body, the echo route rejects unsupported media types, charsets and content encodings with `415`, and preserves the validated JSON value without rounding numeric literals during serialization. It enforces 16 KiB for both declared-length and chunked uploads. The HTTP listener sends `100 Continue` only after the echo request passes admission and header validation. Every Express response carries `Cache-Control: no-store`.
-
-```http
-GET /api/demo HTTP/1.1
-Host: localhost:3000
-
-HTTP/1.1 200 OK
-Content-Type: application/json; charset=utf-8
-Cache-Control: no-store
-RateLimit-Limit: 10
-RateLimit-Remaining: 9
-RateLimit-Reset: 60
-
-{"message":"Request accepted","ip":"127.0.0.1"}
-```
+<div dir="ltr">
 
 ```http
 HTTP/1.1 429 Too Many Requests
@@ -99,55 +88,82 @@ Retry-After: 58
 {"error":"TOO_MANY_REQUESTS","message":"Rate limit exceeded. Please retry later."}
 ```
 
-| Header                | Meaning                                                                                                                                                             |
-| --------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `RateLimit-Limit`     | Maximum accepted requests per rolling window                                                                                                                        |
-| `RateLimit-Remaining` | Available slots immediately after the decision                                                                                                                      |
-| `RateLimit-Reset`     | Delta seconds until the oldest active timestamp expires, rounded up. Slots recover as individual timestamps age out.                                                |
-| `Retry-After`         | On `429`, the same delta as reset. On capacity `503`, the seconds until the first bucket could expire, rounded up. Later accepted traffic may change that estimate. |
+</div>
 
-The three `RateLimit-*` fields are this service's compatibility contract. Clients can use the standard delay-seconds form of `Retry-After`. Shared traffic may consume a slot before a retry arrives. [HTTP Retry-After](https://www.rfc-editor.org/rfc/rfc9110.html#name-retry-after) · [IETF RateLimit work](https://datatracker.ietf.org/doc/draft-ietf-httpapi-ratelimit-headers/)
+| هدر                   | معنی                                                                                                                                                                       |
+| --------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `RateLimit-Limit`     | سقف درخواست‌های قابل پذیرش در پنجرهٔ لغزان                                                                                                                                  |
+| `RateLimit-Remaining` | سهمیهٔ باقی‌مانده پس از تصمیم فعلی                                                                                                                                          |
+| `RateLimit-Reset`     | ثانیه تا انقضای قدیمی‌ترین درخواست فعال، گرد‌شده به بالا                                                                                                                   |
+| `Retry-After`         | در `429` برابر `RateLimit-Reset` است. در `503` ناشی از ظرفیت، زمان تقریبی تا آزاد شدن اولین جای IP را برحسب ثانیه نشان می‌دهد. ترافیک بعدی می‌تواند این زمان را تغییر دهد. |
 
-Errors use a JSON `error` code and `message`. Invalid identity or JSON returns `400`, unknown routes return `404`, oversized JSON returns `413`, and unexpected application errors return a generic `500`. A new IP gets `503` when every bucket is active. Existing clients keep their history. Invalid identities and capacity rejections carry no per-IP quota fields.
+## تنظیمات
 
-## Tests and CI
+تنظیمات از متغیرهای محیطی خوانده می‌شوند. فایل [نمونهٔ تنظیمات](.env.example) مرجع مقادیر است و خودکار بارگذاری نمی‌شود. در Docker می‌توانید فایل تنظیمات را با `--env-file` بدهید.
 
-```sh
-npm run typecheck
-npm run lint
-npm run format:check
-npm test
-npm run test:core
-npm run test:coverage
-npm run smoke
-npm audit --omit=dev
-```
+| متغیر                     | پیش‌فرض | کاربرد و محدوده                                                   |
+| ------------------------- | ------- | ----------------------------------------------------------------- |
+| `PORT`                    | `3000`  | پورت HTTP، از ۱ تا ۶۵٬۵۳۵                                         |
+| `RATE_LIMIT_WINDOW_MS`    | `60000` | طول پنجره، از ۱۰۰ تا ۳٬۶۰۰٬۰۰۰ میلی‌ثانیه                         |
+| `RATE_LIMIT_MAX_REQUESTS` | `10`    | سقف درخواست هر IP در پنجره، از ۱ تا ۱۰٬۰۰۰                        |
+| `MAX_TRACKED_IPS`         | `10000` | سقف تعداد IPهای نگهداری‌شده، از ۱ تا ۱٬۰۰۰٬۰۰۰                    |
+| `TRUSTED_PROXY_CIDRS`     | خالی    | حداکثر ۳۲ نشانی IP یا بازهٔ CIDR پراکسی مورداعتماد، جداشده با کاما |
 
-The coverage command runs all tests and enforces a 90% aggregate branch threshold for compiled source. Tests cover five seeded reference-model streams, controlled time, HTTP headers and routing, concurrent admissions, and shutdown. CI installs the lockfile and runs the quality gates on Node.js 22 and 24. [Workflow](.github/workflows/ci.yml) · [Verification evidence](docs/verification/FINAL-REPORT.md)
+حاصل‌ضرب `RATE_LIMIT_MAX_REQUESTS` و `MAX_TRACKED_IPS` حداکثر یک میلیون است. این عدد تعداد زمان‌های قابل ذخیره را محدود می‌کند. سرویس در صورت نامعتبر بودن تنظیمات اجرا نمی‌شود.
 
-## Docker
+### استقرار پشت پراکسی
+
+در حالت پیش‌فرض، سرویس `X-Forwarded-For` را نادیده می‌گیرد. برای استقرار پشت reverse proxy، فقط IP یا CIDR مبدأ پراکسی‌های تحت کنترل خود را در `TRUSTED_PROXY_CIDRS` بگذارید. پراکسی مرزی باید هدرهای مربوط به IP کلاینت را خودش تنظیم کند و دسترسی مستقیم به پورت سرویس باید محدود باشد. [سیاست امنیتی و فرض‌های شبکه](docs/SECURITY.md)
+
+## اجرا با Docker
+
+<div dir="ltr">
 
 ```sh
 docker build -t ip-sliding-window-limiter .
 docker run --rm --stop-timeout 12 -p 127.0.0.1:3000:3000 ip-sliding-window-limiter
 ```
 
-The image uses a digest-pinned Node 24 Alpine base and runs Node as the non-root `node` user with only production dependencies. After a shutdown signal, the service closes its listener, refuses new requests on existing connections with `503`, and gives previously admitted requests up to ten seconds to finish. Allow the container runtime enough time to deliver the signal and let the process drain.
+</div>
 
-## Benchmarks
+تصویر از Node.js 24 روی Alpine با digest ثابت استفاده می‌کند و سرویس با کاربر بدون دسترسی root اجرا می‌شود. هنگام خاموشی، درخواست‌های پذیرفته‌شده حداکثر ۱۰ ثانیه برای تکمیل فرصت دارند.
+
+## آزمون و سنجش کارایی
+
+<div dir="ltr">
 
 ```sh
+npm test
+npm run test:coverage
+npm run typecheck
+npm run lint
+npm run format:check
+npm run smoke
 npm run bench
 ```
 
-The script reports throughput, p50/p95/p99 latency, CPU time, tracked clients, and before/after heap and RSS snapshots. In one local Windows run on Node 24.22.3, 2,000 loopback requests at concurrency 16 produced 1,000 responses of each status, `200` and `429`. Throughput was 4,499 requests/s with p95 of 7.35 ms. The core scenarios each ran 100,000 decisions across repeated clients, independent keys, full capacity and expiration. [Environment, measurements and limitations](docs/verification/FINAL-REPORT.md#performance)
+</div>
 
-## Deployment scope and future work
+آزمون‌ها مرز انقضا، ترافیک هم‌زمان، ظرفیت حافظه، تشخیص IP پشت پراکسی، اندازهٔ بدنه و خاموشی را پوشش می‌دهند. در بررسی ثبت‌شده، **۶۱ آزمون** با **۹۶٫۵۳٪ پوشش شاخه‌ها** پاس شدند. گردش کار CI بررسی‌ها را روی Node.js 22 و 24 اجرا می‌کند. [اجراهای CI](https://github.com/alirava56/IP-Sliding-Window-Rate-Limiter/actions/workflows/ci.yml) · [گزارش راستی‌آزمایی](docs/verification/FINAL-REPORT.md)
 
-State belongs to one Node process and resets on restart. NAT users share a quota, while different IPv6 addresses have independent quotas. A full store can temporarily deny service to new IPs. `/health` remains available during throttling. Perimeter controls handle connection pressure and traffic floods ahead of Node.
+دستور `npm run bench` نرخ پردازش، صدک‌های تأخیر و مصرف حافظه و CPU را گزارش می‌کند. در یک اجرای محلی روی Windows با هم‌زمانی ۱۶، نرخ **۴٬۴۹۹ درخواست در ثانیه** و تأخیر **۷٫۳۵ میلی‌ثانیه در صدک ۹۵** ثبت شد. این اعداد مربوط به همان آزمون محلی‌اند. [روش و جزئیات اندازه‌گیری](docs/verification/FINAL-REPORT.md#performance)
 
-The next steps for multi-replica deployment are an atomic shared store, an explicit capacity and outage policy, and metrics for admissions, rejections and memory pressure. Account-based quotas can complement IP quotas where authentication is available. [Design and distribution plan](docs/ARCHITECTURE.md) · [Threat model and disclosure](docs/SECURITY.md)
+## ساختار پروژه
 
-## License
+| فایل یا پوشه                                                                   | مسئولیت                                           |
+| ------------------------------------------------------------------------------ | ------------------------------------------------- |
+| [هستهٔ محدودکننده](src/limiter/sliding-window.ts)                               | محاسبهٔ سهمیه، انقضا و ظرفیت                       |
+| [middleware محدودکننده](src/middleware/rate-limit.ts)                          | تبدیل تصمیم سهمیه به هدرها و پاسخ HTTP            |
+| [تشخیص IP](src/ip.ts)                                                          | یکسان‌سازی IP و بررسی فهرست پراکسی‌های مورداعتماد |
+| [برنامهٔ Express](src/app.ts)، [سرور](src/server.ts) و [تنظیمات](src/config.ts) | مسیرهای API، چرخهٔ عمر پردازش و تنظیمات محیطی      |
+| [آزمون‌ها](tests/) و [اسکریپت‌ها](scripts/)                                    | آزمون رگرسیون، آزمون دود و سنجش کارایی            |
 
-MIT. [License text](LICENSE)
+## محدوده استفاده
+
+محدودکننده برای **یک پردازش Node.js** طراحی شده است. با راه‌اندازی مجدد، سهمیه‌ها بازنشانی می‌شوند و هر نمونهٔ سرویس سهمیهٔ مستقل دارد. کلاینت‌های پشت یک NAT سهمیهٔ IP مشترک دارند. برای اعمال سهمیهٔ مشترک بین چند نمونه، وضعیت باید در یک ذخیره‌ساز مشترک با عملیات اتمی نگهداری شود. [طرح مهاجرت به ذخیره‌ساز مشترک](docs/ARCHITECTURE.md#shared-store-migration)
+
+## مجوز
+
+این پروژه تحت [مجوز MIT](LICENSE) منتشر شده است.
+
+</div>
